@@ -13,6 +13,7 @@ import com.pulsequeue.producer.EventPublisher;
 import com.pulsequeue.repository.NotificationDeliveryRepository;
 import com.pulsequeue.repository.ProcessedEventRepository;
 import com.pulsequeue.repository.WebhookSubscriptionRepository;
+import com.pulsequeue.service.EventReplayService;
 import com.pulsequeue.service.WebhookSubscriptionService;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
@@ -42,6 +43,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.IntUnaryOperator;
@@ -134,6 +136,29 @@ class PulseQueueIntegrationTest {
         }
     }
 
+    /** Fails every send for events flagged {@code failUntilFixed} while {@link #broken} is set. */
+    static class SwitchableChannel implements NotificationChannel {
+
+        final AtomicBoolean broken = new AtomicBoolean(true);
+
+        @Override
+        public String getChannelName() {
+            return "TEST_SWITCH";
+        }
+
+        @Override
+        public List<String> targetsFor(DomainEvent event) {
+            return Boolean.TRUE.equals(event.payload().get("failUntilFixed")) ? List.of("switch") : List.of();
+        }
+
+        @Override
+        public void send(DomainEvent event, String target) {
+            if (broken.get()) {
+                throw new IllegalStateException("destination is down");
+            }
+        }
+    }
+
     /** Counts sends per event and never fails. */
     static class CountingChannel implements NotificationChannel {
 
@@ -202,6 +227,11 @@ class PulseQueueIntegrationTest {
         CountingChannel countingChannel() {
             return new CountingChannel();
         }
+
+        @Bean
+        SwitchableChannel switchableChannel() {
+            return new SwitchableChannel();
+        }
     }
 
     @Autowired
@@ -212,6 +242,10 @@ class PulseQueueIntegrationTest {
     private NotificationDeliveryRepository deliveryRepository;
     @Autowired
     private CountingChannel countingChannel;
+    @Autowired
+    private SwitchableChannel switchableChannel;
+    @Autowired
+    private EventReplayService replayService;
     @Autowired
     private WebhookSubscriptionService webhookSubscriptions;
     @Autowired
@@ -356,6 +390,48 @@ class PulseQueueIntegrationTest {
 
             webhookSubscriptions.delete(subscription.getId());
         }
+    }
+
+    @Test
+    void deadLetteredEventCanBeReplayedAndOnlyTheDestinationThatFailedIsRetried() {
+        String recipient = UUID.randomUUID() + "@cashpilot.example";
+        DomainEvent event = DomainEvent.of("expense.created", "cashpilot",
+                Map.of("failUntilFixed", true, "recipientEmail", recipient, "amount", 99.5));
+        switchableChannel.broken.set(true);
+
+        publisher.publish(event);
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            Optional<ProcessedEvent> record = repository.findByEventId(event.eventId());
+            assertTrue(record.isPresent(), "event should have been recorded by now");
+            assertEquals(ProcessedEventStatus.DEAD_LETTERED, record.get().getStatus());
+        });
+        assertEquals(3, repository.findByEventId(event.eventId()).orElseThrow().getRetryCount());
+        assertEquals(1, countingChannel.sendsFor(event.eventId()));
+        assertEquals(1, emailsReceivedBy(recipient));
+
+        switchableChannel.broken.set(false);
+        assertEquals(EventReplayService.Result.REPLAYED, replayService.replay(event.eventId()));
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertEquals(ProcessedEventStatus.PROCESSED,
+                        repository.findByEventId(event.eventId()).orElseThrow().getStatus()));
+
+        ProcessedEvent replayed = repository.findByEventId(event.eventId()).orElseThrow();
+        assertEquals(1, replayed.getReplayCount());
+        assertEquals(3, replayed.getRetryCount(), "the replay succeeded first time, so no new failed attempt");
+        assertEquals(1, countingChannel.sendsFor(event.eventId()),
+                "a destination delivered before the dead-letter must not be sent again by the replay");
+        assertEquals(1, emailsReceivedBy(recipient), "the replay must not send a second email");
+
+        NotificationDelivery fixed = deliveryRepository.findByEventIdOrderByIdAsc(event.eventId()).stream()
+                .filter(row -> row.getChannel().equals("TEST_SWITCH")).findFirst().orElseThrow();
+        assertEquals(DeliveryStatus.DELIVERED, fixed.getStatus());
+        assertEquals(4, fixed.getAttempts(), "three failed attempts, then the replay");
+
+        assertEquals(EventReplayService.Result.NOT_DEAD_LETTERED, replayService.replay(event.eventId()),
+                "an event that already went through cannot be replayed again");
+        assertEquals(EventReplayService.Result.NOT_FOUND, replayService.replay(UUID.randomUUID().toString()));
     }
 
     private long emailsReceivedBy(String recipient) {

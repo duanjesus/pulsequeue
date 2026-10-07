@@ -47,16 +47,24 @@ public class ProcessedEvent {
     @Column(name = "processed_at")
     private Instant processedAt;
 
+    @Column(name = "replay_count", nullable = false)
+    private int replayCount;
+
+    @Column(name = "occurred_at")
+    private Instant occurredAt;
+
     protected ProcessedEvent() {
         // JPA
     }
 
-    public static ProcessedEvent received(String eventId, String eventType, String sourceService, String payload) {
+    public static ProcessedEvent received(String eventId, String eventType, String sourceService, String payload,
+                                          Instant occurredAt) {
         ProcessedEvent record = new ProcessedEvent();
         record.eventId = eventId;
         record.eventType = eventType;
         record.sourceService = sourceService;
         record.payload = payload;
+        record.occurredAt = occurredAt;
         record.status = ProcessedEventStatus.RECEIVED;
         record.retryCount = 0;
         record.receivedAt = Instant.now();
@@ -123,5 +131,13 @@ public class ProcessedEvent {
 
     public Instant getProcessedAt() {
         return processedAt;
+    }
+
+    public int getReplayCount() {
+        return replayCount;
+    }
+
+    public Instant getOccurredAt() {
+        return occurredAt;
     }
 }

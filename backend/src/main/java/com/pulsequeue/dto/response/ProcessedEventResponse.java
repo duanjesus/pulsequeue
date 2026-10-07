@@ -11,6 +11,7 @@ public record ProcessedEventResponse(
         String sourceService,
         String status,
         int retryCount,
+        int replayCount,
         String errorMessage,
         Instant receivedAt,
         Instant processedAt
@@ -24,6 +25,7 @@ public record ProcessedEventResponse(
                 event.getSourceService(),
                 event.getStatus().name(),
                 event.getRetryCount(),
+                event.getReplayCount(),
                 event.getErrorMessage(),
                 event.getReceivedAt(),
                 event.getProcessedAt());

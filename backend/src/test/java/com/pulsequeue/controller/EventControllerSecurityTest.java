@@ -4,8 +4,10 @@ import com.pulsequeue.producer.EventPublisher;
 import com.pulsequeue.security.ApiKeyAuthFilter;
 import com.pulsequeue.security.ApiKeyProperties;
 import com.pulsequeue.security.SecurityConfig;
+import com.pulsequeue.service.EventReplayService;
 import com.pulsequeue.service.RateLimitService;
 import org.junit.jupiter.api.Test;
+import org.springframework.amqp.AmqpConnectException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -16,8 +18,10 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -44,6 +48,8 @@ class EventControllerSecurityTest {
     private EventPublisher publisher;
     @MockBean
     private RateLimitService rateLimitService;
+    @MockBean
+    private EventReplayService replayService;
 
     @Test
     void rejectsPublishRequestWithoutApiKey() throws Exception {
@@ -77,5 +83,36 @@ class EventControllerSecurityTest {
     void simulateEndpointAlsoRequiresApiKey() throws Exception {
         mockMvc.perform(post("/api/v1/events/simulate"))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void replayRequiresApiKey() throws Exception {
+        mockMvc.perform(post("/api/v1/events/e-1/replay"))
+                .andExpect(status().isUnauthorized());
+
+        verifyNoInteractions(replayService);
+    }
+
+    @Test
+    void replayAnswersAcceptedNotFoundOrConflictDependingOnTheEvent() throws Exception {
+        when(replayService.replay("dead")).thenReturn(EventReplayService.Result.REPLAYED);
+        when(replayService.replay("missing")).thenReturn(EventReplayService.Result.NOT_FOUND);
+        when(replayService.replay("done")).thenReturn(EventReplayService.Result.NOT_DEAD_LETTERED);
+
+        mockMvc.perform(post("/api/v1/events/dead/replay").header(ApiKeyAuthFilter.API_KEY_HEADER, "test-secret-key"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("REPLAYED"));
+        mockMvc.perform(post("/api/v1/events/missing/replay").header(ApiKeyAuthFilter.API_KEY_HEADER, "test-secret-key"))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(post("/api/v1/events/done/replay").header(ApiKeyAuthFilter.API_KEY_HEADER, "test-secret-key"))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    void replayWhileTheBrokerIsDownIsServiceUnavailable() throws Exception {
+        when(replayService.replay("dead")).thenThrow(new AmqpConnectException(new RuntimeException("refused")));
+
+        mockMvc.perform(post("/api/v1/events/dead/replay").header(ApiKeyAuthFilter.API_KEY_HEADER, "test-secret-key"))
+                .andExpect(status().isServiceUnavailable());
     }
 }

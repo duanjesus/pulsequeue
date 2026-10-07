@@ -1,12 +1,15 @@
 package com.pulsequeue.service;
 
 import com.pulsequeue.entity.ProcessedEvent;
+import com.pulsequeue.entity.ProcessedEventStatus;
 import com.pulsequeue.event.DomainEvent;
 import com.pulsequeue.repository.ProcessedEventRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
 
 /**
  * Each method here is its own transaction, committed independently the
@@ -34,7 +37,22 @@ public class ProcessedEventRecorder {
     public ProcessedEvent findOrCreate(DomainEvent event) {
         return repository.findByEventId(event.eventId())
                 .orElseGet(() -> repository.save(ProcessedEvent.received(
-                        event.eventId(), event.eventType(), event.sourceService(), toJson(event.payload()))));
+                        event.eventId(), event.eventType(), event.sourceService(), toJson(event.payload()),
+                        event.occurredAt())));
+    }
+
+    /** Takes a dead-lettered event back to RECEIVED; false if it was not dead-lettered (any more). */
+    @Transactional
+    public boolean claimForReplay(String eventId) {
+        return repository.transition(eventId,
+                ProcessedEventStatus.DEAD_LETTERED, ProcessedEventStatus.RECEIVED, 1, null) == 1;
+    }
+
+    /** Undoes {@link #claimForReplay} when the event could not be put back on the queue. */
+    @Transactional
+    public void releaseReplayClaim(String eventId) {
+        repository.transition(eventId,
+                ProcessedEventStatus.RECEIVED, ProcessedEventStatus.DEAD_LETTERED, -1, Instant.now());
     }
 
     @Transactional

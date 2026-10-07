@@ -43,7 +43,8 @@ class EventProcessingServiceTest {
     @Test
     void successfulProcessingRecordsProcessedAndClaimsDedupKey() {
         DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("amount", 10));
-        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}");
+        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}",
+                event.occurredAt());
         when(recorder.findOrCreate(event)).thenReturn(record);
         when(deduplicationService.isDuplicate(event.eventId())).thenReturn(false);
 
@@ -58,7 +59,8 @@ class EventProcessingServiceTest {
     @Test
     void duplicateEventSkipsDispatchAndRecordsDuplicate() {
         DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("amount", 10));
-        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}");
+        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}",
+                event.occurredAt());
         when(recorder.findOrCreate(event)).thenReturn(record);
         when(deduplicationService.isDuplicate(event.eventId())).thenReturn(true);
 
@@ -73,7 +75,8 @@ class EventProcessingServiceTest {
     @Test
     void failedDispatchRecordsFailureAndRethrows() {
         DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("simulateFailure", true));
-        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}");
+        ProcessedEvent record = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}",
+                event.occurredAt());
         when(recorder.findOrCreate(event)).thenReturn(record);
         when(deduplicationService.isDuplicate(event.eventId())).thenReturn(false);
         doThrow(new NotificationDeliveryException("boom")).when(dispatchService).dispatch(event);
@@ -88,7 +91,8 @@ class EventProcessingServiceTest {
     @Test
     void reprocessingAnAlreadyFailedRecordRecordsARetryMetric() {
         DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("amount", 10));
-        ProcessedEvent existing = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}");
+        ProcessedEvent existing = ProcessedEvent.received(event.eventId(), event.eventType(), event.sourceService(), "{}",
+                event.occurredAt());
         existing.markFailed("previous attempt failed");
         when(recorder.findOrCreate(event)).thenReturn(existing);
         when(deduplicationService.isDuplicate(event.eventId())).thenReturn(false);
