@@ -6,13 +6,19 @@ import com.pulsequeue.event.DomainEvent;
 import com.pulsequeue.repository.InstitutionMappingRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -25,6 +31,9 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 class PulseHubNotificationChannelTest {
+
+    private final DomainEvent surplusAlert = DomainEvent.of("supply.surplus_alert", "social-supply",
+            Map.of("targetInstitutionId", 7, "message", "Sobra de arroz"));
 
     private InstitutionMappingRepository mappingRepository;
     private MockRestServiceServer server;
@@ -40,56 +49,50 @@ class PulseHubNotificationChannelTest {
     }
 
     @Test
-    void skipsSilentlyWhenPayloadHasNoTargetInstitutionOrMessage() {
+    void hasNoTargetWhenPayloadHasNoTargetInstitutionOrMessage() {
         DomainEvent event = DomainEvent.of("donation.created", "social-supply", Map.of("donationId", 1));
 
-        channel.send(event);
+        assertTrue(channel.targetsFor(event).isEmpty());
 
         verifyNoInteractions(mappingRepository);
-        server.verify();
     }
 
     @Test
-    void skipsSilentlyWhenInstitutionHasNoPulseHubMapping() {
+    void hasNoTargetWhenInstitutionHasNoPulseHubMapping() {
         when(mappingRepository.findByInstitutionId(7L)).thenReturn(Optional.empty());
-        DomainEvent event = DomainEvent.of("supply.surplus_alert", "social-supply",
-                Map.of("targetInstitutionId", 7, "message", "Sobra de arroz"));
 
-        channel.send(event);
+        assertTrue(channel.targetsFor(surplusAlert).isEmpty());
 
         verify(mappingRepository).findByInstitutionId(7L);
-        server.verify();
     }
 
     @Test
-    void deliversToPulseHubWhenMappingExists() {
+    void targetsTheMappedPulseHubUser() {
         when(mappingRepository.findByInstitutionId(7L)).thenReturn(Optional.of(InstitutionMapping.of(7L, 42L)));
-        DomainEvent event = DomainEvent.of("supply.surplus_alert", "social-supply",
-                Map.of("targetInstitutionId", 7, "message", "Sobra de arroz"));
 
+        assertEquals(List.of("42"), channel.targetsFor(surplusAlert));
+    }
+
+    @Test
+    void deliversToPulseHub() {
         server.expect(requestTo("http://pulsehub/api/v1/system-messages"))
-                .andExpect(method(org.springframework.http.HttpMethod.POST))
+                .andExpect(method(HttpMethod.POST))
                 .andExpect(header("X-API-Key", "test-key"))
                 .andExpect(content().contentType(MediaType.APPLICATION_JSON))
                 .andExpect(content().json("{\"targetUserId\":42,\"content\":\"Sobra de arroz\"}"))
                 .andRespond(withSuccess());
 
-        channel.send(event);
+        channel.send(surplusAlert, "42");
 
         server.verify();
     }
 
     @Test
-    void swallowsDeliveryFailuresInsteadOfThrowing() {
-        when(mappingRepository.findByInstitutionId(7L)).thenReturn(Optional.of(InstitutionMapping.of(7L, 42L)));
-        DomainEvent event = DomainEvent.of("supply.surplus_alert", "social-supply",
-                Map.of("targetInstitutionId", 7, "message", "Sobra de arroz"));
-
+    void failsLoudlyButIsBestEffortSoTheDispatcherWillNotFailTheEvent() {
         server.expect(requestTo("http://pulsehub/api/v1/system-messages"))
                 .andRespond(withServerError());
 
-        channel.send(event);
-
-        server.verify();
+        assertThrows(RestClientException.class, () -> channel.send(surplusAlert, "42"));
+        assertTrue(channel.isBestEffort());
     }
 }

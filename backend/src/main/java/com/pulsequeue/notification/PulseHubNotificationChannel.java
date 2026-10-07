@@ -9,19 +9,19 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestClientException;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 /**
- * Bridges an event to a real PulseHub inbox: only acts when the payload
- * carries both {@code targetInstitutionId} and {@code message} — any other
- * event is a silent no-op, the same "notified regardless of type" shape as
- * this platform's Email/Push/WebSocket channels, just gated on payload shape
- * instead of always firing. Best-effort: a delivery failure is logged, never
- * rethrown, so an unreachable PulseHub instance can't turn an unrelated
- * event into a retry/DLQ entry.
+ * Bridges an event to a real PulseHub inbox: only applies when the payload
+ * carries both {@code targetInstitutionId} and {@code message} and that
+ * institution has a mapping — any other event has no target. The target is
+ * the PulseHub user id. Best-effort: {@link #send} throws on failure like any
+ * other channel, but {@link #isBestEffort()} tells the dispatcher to record
+ * and log it rather than fail the event, so an unreachable PulseHub instance
+ * can't turn an unrelated event into a retry/DLQ entry.
  */
 @Component
 public class PulseHubNotificationChannel implements NotificationChannel {
@@ -45,42 +45,45 @@ public class PulseHubNotificationChannel implements NotificationChannel {
     }
 
     @Override
-    public void send(DomainEvent event) {
+    public boolean isBestEffort() {
+        return true;
+    }
+
+    @Override
+    public List<String> targetsFor(DomainEvent event) {
         Object institutionIdRaw = event.payload().get("targetInstitutionId");
-        Object messageRaw = event.payload().get("message");
-        if (institutionIdRaw == null || messageRaw == null) {
-            return;
+        if (institutionIdRaw == null || event.payload().get("message") == null) {
+            return List.of();
         }
 
         Long institutionId = asLong(institutionIdRaw);
         if (institutionId == null) {
             log.warn("eventId={} has a non-numeric targetInstitutionId={}, skipping PulseHub delivery",
                     event.eventId(), institutionIdRaw);
-            return;
+            return List.of();
         }
 
         Optional<InstitutionMapping> mapping = mappingRepository.findByInstitutionId(institutionId);
         if (mapping.isEmpty()) {
             log.info("No PulseHub mapping for institutionId={}, skipping delivery for eventId={}",
                     institutionId, event.eventId());
-            return;
+            return List.of();
         }
+        return List.of(String.valueOf(mapping.get().getPulsehubUserId()));
+    }
 
-        try {
-            restClient.post()
-                    .uri("/api/v1/system-messages")
-                    .header("X-API-Key", apiKey)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(Map.of(
-                            "targetUserId", mapping.get().getPulsehubUserId(),
-                            "content", messageRaw.toString()))
-                    .retrieve()
-                    .toBodilessEntity();
-            log.info("Delivered eventId={} to PulseHub userId={}", event.eventId(), mapping.get().getPulsehubUserId());
-        } catch (RestClientException ex) {
-            log.warn("Failed to deliver eventId={} to PulseHub (institutionId={}): {}",
-                    event.eventId(), institutionId, ex.getMessage());
-        }
+    @Override
+    public void send(DomainEvent event, String target) {
+        restClient.post()
+                .uri("/api/v1/system-messages")
+                .header("X-API-Key", apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of(
+                        "targetUserId", Long.parseLong(target),
+                        "content", event.payload().get("message").toString()))
+                .retrieve()
+                .toBodilessEntity();
+        log.info("Delivered eventId={} to PulseHub userId={}", event.eventId(), target);
     }
 
     private Long asLong(Object value) {

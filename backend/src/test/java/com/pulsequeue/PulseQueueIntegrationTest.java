@@ -1,13 +1,19 @@
 package com.pulsequeue;
 
+import com.pulsequeue.entity.DeliveryStatus;
+import com.pulsequeue.entity.NotificationDelivery;
 import com.pulsequeue.entity.ProcessedEvent;
 import com.pulsequeue.entity.ProcessedEventStatus;
 import com.pulsequeue.event.DomainEvent;
+import com.pulsequeue.notification.NotificationChannel;
 import com.pulsequeue.producer.EventPublisher;
+import com.pulsequeue.repository.NotificationDeliveryRepository;
 import com.pulsequeue.repository.ProcessedEventRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -19,9 +25,14 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -76,10 +87,77 @@ class PulseQueueIntegrationTest {
         registry.add("pulsequeue.retry.max-interval-ms", () -> "100");
     }
 
+    /** Counts sends per event, and fails the first one for events flagged {@code failFirstSend}. */
+    static class FlakyOnceChannel implements NotificationChannel {
+
+        private final Map<String, AtomicInteger> sends = new ConcurrentHashMap<>();
+
+        @Override
+        public String getChannelName() {
+            return "TEST_FLAKY";
+        }
+
+        @Override
+        public List<String> targetsFor(DomainEvent event) {
+            return Boolean.TRUE.equals(event.payload().get("failFirstSend")) ? List.of("flaky") : List.of();
+        }
+
+        @Override
+        public void send(DomainEvent event, String target) {
+            if (sends.computeIfAbsent(event.eventId(), id -> new AtomicInteger()).incrementAndGet() == 1) {
+                throw new IllegalStateException("first send always fails");
+            }
+        }
+    }
+
+    /** Counts sends per event and never fails. */
+    static class CountingChannel implements NotificationChannel {
+
+        private final Map<String, AtomicInteger> sends = new ConcurrentHashMap<>();
+
+        @Override
+        public String getChannelName() {
+            return "TEST_COUNTER";
+        }
+
+        @Override
+        public List<String> targetsFor(DomainEvent event) {
+            return List.of("counter");
+        }
+
+        @Override
+        public void send(DomainEvent event, String target) {
+            sends.computeIfAbsent(event.eventId(), id -> new AtomicInteger()).incrementAndGet();
+        }
+
+        int sendsFor(String eventId) {
+            AtomicInteger count = sends.get(eventId);
+            return count == null ? 0 : count.get();
+        }
+    }
+
+    @TestConfiguration
+    static class TestChannels {
+
+        @Bean
+        FlakyOnceChannel flakyOnceChannel() {
+            return new FlakyOnceChannel();
+        }
+
+        @Bean
+        CountingChannel countingChannel() {
+            return new CountingChannel();
+        }
+    }
+
     @Autowired
     private EventPublisher publisher;
     @Autowired
     private ProcessedEventRepository repository;
+    @Autowired
+    private NotificationDeliveryRepository deliveryRepository;
+    @Autowired
+    private CountingChannel countingChannel;
 
     @Test
     void publishedEventIsConsumedAndMarkedProcessed() {
@@ -106,6 +184,33 @@ class PulseQueueIntegrationTest {
             assertEquals(ProcessedEventStatus.DEAD_LETTERED, record.get().getStatus());
             assertTrue(record.get().getRetryCount() >= 1);
         });
+    }
+
+    @Test
+    void retryResendsOnlyTheDestinationThatFailed() {
+        DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("failFirstSend", true));
+
+        publisher.publish(event);
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            Optional<ProcessedEvent> record = repository.findByEventId(event.eventId());
+            assertTrue(record.isPresent(), "event should have been recorded by now");
+            assertEquals(ProcessedEventStatus.PROCESSED, record.get().getStatus());
+            assertEquals(1, record.get().getRetryCount());
+        });
+
+        assertEquals(1, countingChannel.sendsFor(event.eventId()),
+                "a destination delivered on the first attempt must not be sent again on the retry");
+
+        Map<String, NotificationDelivery> deliveries = deliveryRepository.findByEventIdOrderByIdAsc(event.eventId())
+                .stream().collect(Collectors.toMap(NotificationDelivery::getChannel, Function.identity()));
+        assertTrue(deliveries.keySet().containsAll(List.of("EMAIL", "PUSH", "WEBSOCKET", "TEST_COUNTER", "TEST_FLAKY")),
+                "every channel that applied should have a delivery row, got " + deliveries.keySet());
+        deliveries.values().forEach(delivery ->
+                assertEquals(DeliveryStatus.DELIVERED, delivery.getStatus(), delivery.getChannel()));
+        assertEquals(2, deliveries.get("TEST_FLAKY").getAttempts());
+        assertEquals(1, deliveries.get("TEST_COUNTER").getAttempts());
+        assertEquals(1, deliveries.get("EMAIL").getAttempts());
     }
 
     @Test

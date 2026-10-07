@@ -5,6 +5,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
+
 /**
  * Simulated channel — logs what a real email provider integration would send,
  * rather than calling one. Mirrors the "Email" leg of the platform's fan-out.
@@ -20,7 +22,12 @@ public class EmailNotificationChannel implements NotificationChannel {
     }
 
     @Override
-    public void send(DomainEvent event) {
+    public List<String> targetsFor(DomainEvent event) {
+        return List.of("simulated");
+    }
+
+    @Override
+    public void send(DomainEvent event, String target) {
         log.info("[Email] Notified about {} from {} (eventId={})",
                 event.eventType(), event.sourceService(), event.eventId());
     }
