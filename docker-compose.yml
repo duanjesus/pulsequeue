@@ -47,6 +47,14 @@ services:
       timeout: 5s
       retries: 5
 
+  mailpit:
+    image: axllent/mailpit:v1.31.3
+    container_name: pulsequeue-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8027:8025"
+
   api:
     build: ./backend
     container_name: pulsequeue-api
@@ -58,7 +66,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mailpit:
+        condition: service_started
     environment:
+      MAIL_HOST: mailpit
+      MAIL_PORT: 1025
       DB_HOST: db
       DB_PORT: 5432
       DB_NAME: pulsequeue_db

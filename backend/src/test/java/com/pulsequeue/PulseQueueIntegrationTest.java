@@ -1,5 +1,6 @@
 package com.pulsequeue;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.pulsequeue.entity.DeliveryStatus;
 import com.pulsequeue.entity.NotificationDelivery;
 import com.pulsequeue.entity.ProcessedEvent;
@@ -16,9 +17,11 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.web.client.RestClient;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.RabbitMQContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
@@ -61,6 +64,11 @@ class PulseQueueIntegrationTest {
     static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
             .withExposedPorts(6379);
 
+    @Container
+    static final GenericContainer<?> MAILPIT = new GenericContainer<>(DockerImageName.parse("axllent/mailpit:v1.31.3"))
+            .withExposedPorts(1025, 8025)
+            .waitingFor(Wait.forHttp("/readyz").forPort(8025));
+
     @DynamicPropertySource
     static void overrideProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
@@ -74,6 +82,9 @@ class PulseQueueIntegrationTest {
 
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+
+        registry.add("spring.mail.host", MAILPIT::getHost);
+        registry.add("spring.mail.port", () -> MAILPIT.getMappedPort(1025));
 
         // Shrink retry backoff for the test run: the default (500ms/2x/5s max,
         // ~1.5s worst case) is tuned for real usage, not for minimizing how
@@ -188,7 +199,9 @@ class PulseQueueIntegrationTest {
 
     @Test
     void retryResendsOnlyTheDestinationThatFailed() {
-        DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("failFirstSend", true));
+        String recipient = UUID.randomUUID() + "@cashpilot.example";
+        DomainEvent event = DomainEvent.of("expense.created", "cashpilot",
+                Map.of("failFirstSend", true, "recipientEmail", recipient));
 
         publisher.publish(event);
 
@@ -211,6 +224,40 @@ class PulseQueueIntegrationTest {
         assertEquals(2, deliveries.get("TEST_FLAKY").getAttempts());
         assertEquals(1, deliveries.get("TEST_COUNTER").getAttempts());
         assertEquals(1, deliveries.get("EMAIL").getAttempts());
+        assertEquals(recipient, deliveries.get("EMAIL").getTarget());
+
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                assertEquals(1, emailsReceivedBy(recipient), "the real inbox must hold exactly one copy"));
+    }
+
+    @Test
+    void eventWithoutRecipientSendsNoEmail() {
+        DomainEvent event = DomainEvent.of("expense.created", "cashpilot", Map.of("amount", 7));
+
+        publisher.publish(event);
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertEquals(ProcessedEventStatus.PROCESSED,
+                        repository.findByEventId(event.eventId()).map(ProcessedEvent::getStatus).orElse(null)));
+        assertTrue(deliveryRepository.findByEventIdOrderByIdAsc(event.eventId()).stream()
+                .noneMatch(delivery -> delivery.getChannel().equals("EMAIL")));
+    }
+
+    private long emailsReceivedBy(String recipient) {
+        JsonNode inbox = RestClient.create()
+                .get()
+                .uri("http://{host}:{port}/api/v1/messages?limit=200", MAILPIT.getHost(), MAILPIT.getMappedPort(8025))
+                .retrieve()
+                .body(JsonNode.class);
+        long count = 0;
+        for (JsonNode message : inbox.path("messages")) {
+            for (JsonNode to : message.path("To")) {
+                if (recipient.equals(to.path("Address").asText())) {
+                    count++;
+                }
+            }
+        }
+        return count;
     }
 
     @Test

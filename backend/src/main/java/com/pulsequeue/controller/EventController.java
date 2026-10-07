@@ -46,11 +46,13 @@ public class EventController {
                 DomainEvent.of("expense.created", "cashpilot", Map.of(
                         "expenseId", 4821,
                         "description", "Office supplies",
-                        "amount", 149.90)),
+                        "amount", 149.90,
+                        "recipientEmail", "finance@cashpilot.example")),
                 DomainEvent.of("donation.created", "social-supply", Map.of(
                         "donationId", 1290,
                         "institution", "Abrigo Esperanca",
-                        "itemCount", 12))
+                        "itemCount", 12,
+                        "recipientEmail", "donations@socialsupply.example"))
         );
         sample.forEach(publisher::publish);
         return ResponseEntity.status(HttpStatus.ACCEPTED)
