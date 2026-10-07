@@ -5,11 +5,16 @@ import com.pulsequeue.entity.DeliveryStatus;
 import com.pulsequeue.entity.NotificationDelivery;
 import com.pulsequeue.entity.ProcessedEvent;
 import com.pulsequeue.entity.ProcessedEventStatus;
+import com.pulsequeue.entity.WebhookSubscription;
 import com.pulsequeue.event.DomainEvent;
 import com.pulsequeue.notification.NotificationChannel;
+import com.pulsequeue.notification.WebhookSigner;
 import com.pulsequeue.producer.EventPublisher;
 import com.pulsequeue.repository.NotificationDeliveryRepository;
 import com.pulsequeue.repository.ProcessedEventRepository;
+import com.pulsequeue.repository.WebhookSubscriptionRepository;
+import com.pulsequeue.service.WebhookSubscriptionService;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -26,6 +31,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -33,12 +41,15 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.IntUnaryOperator;
 import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -96,6 +107,8 @@ class PulseQueueIntegrationTest {
         registry.add("pulsequeue.retry.initial-interval-ms", () -> "20");
         registry.add("pulsequeue.retry.multiplier", () -> "1.5");
         registry.add("pulsequeue.retry.max-interval-ms", () -> "100");
+
+        registry.add("pulsequeue.webhook.max-consecutive-failures", () -> "2");
     }
 
     /** Counts sends per event, and fails the first one for events flagged {@code failFirstSend}. */
@@ -147,6 +160,36 @@ class PulseQueueIntegrationTest {
         }
     }
 
+    /** A real HTTP endpoint on localhost that records what it is sent and answers with a scripted status. */
+    static class WebhookReceiver implements AutoCloseable {
+
+        record Received(String signatureHeader, byte[] body) {
+        }
+
+        final List<Received> requests = new CopyOnWriteArrayList<>();
+        private final HttpServer server;
+
+        WebhookReceiver(IntUnaryOperator statusForRequestNumber) throws IOException {
+            server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+            server.createContext("/hook", exchange -> {
+                byte[] body = exchange.getRequestBody().readAllBytes();
+                requests.add(new Received(exchange.getRequestHeaders().getFirst(WebhookSigner.SIGNATURE_HEADER), body));
+                exchange.sendResponseHeaders(statusForRequestNumber.applyAsInt(requests.size()), -1);
+                exchange.close();
+            });
+            server.start();
+        }
+
+        String url() {
+            return "http://localhost:" + server.getAddress().getPort() + "/hook";
+        }
+
+        @Override
+        public void close() {
+            server.stop(0);
+        }
+    }
+
     @TestConfiguration
     static class TestChannels {
 
@@ -169,6 +212,10 @@ class PulseQueueIntegrationTest {
     private NotificationDeliveryRepository deliveryRepository;
     @Autowired
     private CountingChannel countingChannel;
+    @Autowired
+    private WebhookSubscriptionService webhookSubscriptions;
+    @Autowired
+    private WebhookSubscriptionRepository webhookRepository;
 
     @Test
     void publishedEventIsConsumedAndMarkedProcessed() {
@@ -241,6 +288,74 @@ class PulseQueueIntegrationTest {
                         repository.findByEventId(event.eventId()).map(ProcessedEvent::getStatus).orElse(null)));
         assertTrue(deliveryRepository.findByEventIdOrderByIdAsc(event.eventId()).stream()
                 .noneMatch(delivery -> delivery.getChannel().equals("EMAIL")));
+    }
+
+    @Test
+    void webhookGetsASignedCopyAndIsRetriedUntilItAnswersOk() throws IOException {
+        try (WebhookReceiver receiver = new WebhookReceiver(requestNumber -> requestNumber == 1 ? 500 : 200)) {
+            WebhookSubscription subscription = webhookSubscriptions.create(receiver.url(), "webhooktest.flaky");
+            DomainEvent event = DomainEvent.of("webhooktest.flaky", "cashpilot", Map.of("amount", 5));
+
+            publisher.publish(event);
+
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                Optional<ProcessedEvent> record = repository.findByEventId(event.eventId());
+                assertTrue(record.isPresent(), "event should have been recorded by now");
+                assertEquals(ProcessedEventStatus.PROCESSED, record.get().getStatus());
+                assertEquals(1, record.get().getRetryCount());
+            });
+
+            assertEquals(2, receiver.requests.size(), "one failed call, one successful call, and no more after that");
+            for (WebhookReceiver.Received request : receiver.requests) {
+                long timestamp = Long.parseLong(
+                        request.signatureHeader().substring(2, request.signatureHeader().indexOf(',')));
+                assertEquals(WebhookSigner.header(subscription.getSecret(), timestamp, request.body()),
+                        request.signatureHeader(), "receiver must be able to verify the signature with its secret");
+                assertTrue(new String(request.body(), StandardCharsets.UTF_8).contains(event.eventId()));
+            }
+
+            NotificationDelivery delivery = deliveryRepository.findByEventIdOrderByIdAsc(event.eventId()).stream()
+                    .filter(row -> row.getChannel().equals("WEBHOOK")).findFirst().orElseThrow();
+            assertEquals(String.valueOf(subscription.getId()), delivery.getTarget());
+            assertEquals(DeliveryStatus.DELIVERED, delivery.getStatus());
+            assertEquals(2, delivery.getAttempts());
+
+            WebhookSubscription afterwards = webhookRepository.findById(subscription.getId()).orElseThrow();
+            assertTrue(afterwards.isActive());
+            assertEquals(0, afterwards.getConsecutiveFailures(), "a success resets the failure streak");
+
+            webhookSubscriptions.delete(subscription.getId());
+        }
+    }
+
+    @Test
+    void webhookThatKeepsFailingIsDisabledAndStopsBlockingTheEvent() throws IOException {
+        try (WebhookReceiver receiver = new WebhookReceiver(requestNumber -> 500)) {
+            WebhookSubscription subscription = webhookSubscriptions.create(receiver.url(), "webhooktest.dead");
+            DomainEvent event = DomainEvent.of("webhooktest.dead", "cashpilot", Map.of("amount", 5));
+
+            publisher.publish(event);
+
+            // max-consecutive-failures is 2 in this test: attempts 1 and 2 fail and disable the
+            // subscription, so attempt 3 has no webhook target left and the event completes.
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                Optional<ProcessedEvent> record = repository.findByEventId(event.eventId());
+                assertTrue(record.isPresent(), "event should have been recorded by now");
+                assertEquals(ProcessedEventStatus.PROCESSED, record.get().getStatus());
+                assertEquals(2, record.get().getRetryCount());
+            });
+
+            assertEquals(2, receiver.requests.size());
+            WebhookSubscription afterwards = webhookRepository.findById(subscription.getId()).orElseThrow();
+            assertFalse(afterwards.isActive());
+            assertEquals(2, afterwards.getConsecutiveFailures());
+
+            NotificationDelivery delivery = deliveryRepository.findByEventIdOrderByIdAsc(event.eventId()).stream()
+                    .filter(row -> row.getChannel().equals("WEBHOOK")).findFirst().orElseThrow();
+            assertEquals(DeliveryStatus.FAILED, delivery.getStatus());
+
+            webhookSubscriptions.delete(subscription.getId());
+        }
     }
 
     private long emailsReceivedBy(String recipient) {

@@ -64,6 +64,10 @@ pulsequeue:
     api-key: ${API_KEY:pulsequeue-dev-key-change-me}
   email:
     from: ${MAIL_FROM:notifications@pulsequeue.local}
+  webhook:
+    connect-timeout-ms: 2000
+    read-timeout-ms: 5000
+    max-consecutive-failures: 10
   pulsehub:
     base-url: ${PULSEHUB_BASE_URL:http://localhost:8081}
     api-key: ${PULSEHUB_API_KEY:pulsehub-system-dev-key-change-me}

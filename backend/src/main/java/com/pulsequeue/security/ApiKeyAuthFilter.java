@@ -18,12 +18,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Guards the event-publishing endpoints only (POST /api/v1/events and
- * /api/v1/events/simulate) with a shared-secret header — "only trusted
- * internal services can publish" for a demo, not a real production auth
- * scheme. Every other endpoint (dashboard stats, actuator, swagger) passes
- * through untouched: this is deliberately narrow, not a login wall in front
- * of the whole app.
+ * Guards the write endpoints only — publishing events (POST /api/v1/events*)
+ * and changing webhook subscriptions (any non-GET on /api/v1/webhooks*) —
+ * with a shared-secret header: "only trusted internal services can publish"
+ * for a demo, not a real production auth scheme. Every other endpoint
+ * (dashboard reads, actuator, swagger) passes through untouched: this is
+ * deliberately narrow, not a login wall in front of the whole app.
  */
 public class ApiKeyAuthFilter extends OncePerRequestFilter {
 
@@ -58,7 +58,11 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     }
 
     private boolean isProtected(HttpServletRequest request) {
-        return "POST".equalsIgnoreCase(request.getMethod()) && request.getRequestURI().startsWith("/api/v1/events");
+        String method = request.getMethod();
+        String uri = request.getRequestURI();
+        boolean publishesEvents = "POST".equalsIgnoreCase(method) && uri.startsWith("/api/v1/events");
+        boolean changesWebhooks = !"GET".equalsIgnoreCase(method) && uri.startsWith("/api/v1/webhooks");
+        return publishesEvents || changesWebhooks;
     }
 
     private void writeUnauthorized(HttpServletResponse response) throws IOException {
